@@ -1,0 +1,49 @@
+name: Build Mapping DB
+
+on:
+  schedule:
+    - cron: "15 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mapping-db-resumable
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build / resume mapping database
+        env:
+          TMDB_TOKEN: ${{ secrets.TMDB_TOKEN }}
+          MAX_RUN_SECONDS: "15000"
+        run: python scripts/update.py
+
+      - name: Commit checkpoint, shards and final DB
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .cache Mappings-DB.json.gz
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "Update mapping DB progress"
+          git push
