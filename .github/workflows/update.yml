@@ -38,7 +38,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add .cache Mappings-DB.json.gz
+          # The final gzip does not exist until both Movie and TV traversals
+          # finish. During checkpoint-only runs, stage the resumable state
+          # without treating the optional final artifact as an error.
+          git add .cache
+          if [[ -f Mappings-DB.json.gz ]]; then
+            git add Mappings-DB.json.gz
+          fi
 
           if git diff --cached --quiet; then
             echo "Nothing to commit"
