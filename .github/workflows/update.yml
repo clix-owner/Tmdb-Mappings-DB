@@ -26,6 +26,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Test updater
+        run: python -m unittest discover -s tests -v
+
       - name: Build / resume mapping database
         env:
           TMDB_TOKEN: ${{ secrets.TMDB_TOKEN }}

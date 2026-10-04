@@ -43,7 +43,7 @@ def request_bytes(url, retries=6):
             time.sleep(min(2 ** n, 30))
     raise last
 
-def request_json(url, retries=7):
+def request_json(url, retries=7, allow_not_found=False):
     last = None
     for n in range(retries):
         try:
@@ -52,6 +52,8 @@ def request_json(url, retries=7):
                 return json.load(r)
         except urllib.error.HTTPError as e:
             last = e
+            if e.code == 404 and allow_not_found:
+                return None
             if e.code == 429:
                 time.sleep(max(int(e.headers.get("Retry-After", "2")), 1))
             elif 500 <= e.code < 600:
@@ -103,7 +105,9 @@ def save_shard(media, shard_no, data):
 
 def fetch_external(media, tmdb_id):
     endpoint = "movie" if media == "movie" else "tv"
-    data = request_json(f"{API}/{endpoint}/{tmdb_id}/external_ids")
+    data = request_json(f"{API}/{endpoint}/{tmdb_id}/external_ids", allow_not_found=True)
+    if data is None:
+        return str(tmdb_id), None
     row = {"tmdb": tmdb_id}
     if data.get("imdb_id"):
         row["imdb"] = data["imdb_id"]
@@ -126,10 +130,13 @@ def process_media(media, ids, state, started):
         shard_no = position // SHARD_SIZE
         data = load_shard(media, shard_no)
 
-        missing = [x for x in chunk if str(x) not in data]
+        missing = [x for x in chunk if str(x) not in data or (
+            data[str(x)].get("_not_found") and
+            data[str(x)].get("_export_date") != state.get("export_date"))]
         print(f"{media} shard {shard_no}: {position}-{end}, missing {len(missing)}", flush=True)
 
         if missing:
+            failures = []
             with cf.ThreadPoolExecutor(max_workers=WORKERS) as ex:
                 futures = {ex.submit(fetch_external, media, tid): tid for tid in missing}
                 for fut in cf.as_completed(futures):
@@ -137,14 +144,21 @@ def process_media(media, ids, state, started):
                     try:
                         key, row = fut.result()
                         # Keep all TMDb IDs, even if external IDs are absent.
-                        data[key] = row
+                        if row is None:
+                            print(f"Skipping unavailable {media}/{tid}: HTTP 404", flush=True)
+                            data[key] = {"tmdb": tid, "_not_found": True, "_export_date": state.get("export_date")}
+                        else:
+                            data[key] = row
                     except Exception as e:
                         print(f"Failed {media}/{tid}: {e}", flush=True)
-                        # Do not advance checkpoint past failures.
-                        save_shard(media, shard_no, data)
-                        state["positions"][media] = position
-                        atomic_json(STATE, state)
-                        raise
+                        failures.append(e)
+            # Drain the batch before saving so successful concurrent requests
+            # are retained even when another request fails.
+            if failures:
+                save_shard(media, shard_no, data)
+                state["positions"][media] = position
+                atomic_json(STATE, state)
+                raise failures[0]
 
         data = dict(sorted(data.items(), key=lambda kv: int(kv[0])))
         save_shard(media, shard_no, data)
@@ -157,7 +171,7 @@ def process_media(media, ids, state, started):
 
     return True
 
-def merge_final(day, movie_total, tv_total):
+def merge_final(day, movie_total, tv_total, movie_ids=None, tv_ids=None):
     movies = {}
     tv = {}
 
@@ -165,6 +179,14 @@ def merge_final(day, movie_total, tv_total):
         movies.update(load_json(p, {}))
     for p in sorted(SHARDS.glob("tv-*.json")):
         tv.update(load_json(p, {}))
+
+    active_movies = set(map(str, movie_ids)) if movie_ids is not None else set(movies)
+    active_tv = set(map(str, tv_ids)) if tv_ids is not None else set(tv)
+    skipped = {"movie": sorted(int(k) for k, v in movies.items() if k in active_movies and v.get("_not_found")),
+               "tv": sorted(int(k) for k, v in tv.items() if k in active_tv and v.get("_not_found"))}
+    atomic_json(CACHE / "not-found.json", {"export_date": day.isoformat(), "ids": skipped})
+    movies = {k: v for k, v in movies.items() if k in active_movies and not v.get("_not_found")}
+    tv = {k: v for k, v in tv.items() if k in active_tv and not v.get("_not_found")}
 
     movies = dict(sorted(movies.items(), key=lambda kv: int(kv[0])))
     tv = dict(sorted(tv.items(), key=lambda kv: int(kv[0])))
@@ -195,6 +217,9 @@ def merge_final(day, movie_total, tv_total):
             "movie_count": len(movies),
             "tv_count": len(tv),
             "total": len(movies) + len(tv),
+            "export_movie_count": movie_total,
+            "export_tv_count": tv_total,
+            "not_found_count": sum(map(len, skipped.values())),
         },
         "movies": movies,
         "tv": tv,
@@ -237,7 +262,7 @@ def main():
         return
 
     # Only publish a new final gzip after both traversals finish.
-    merge_final(day, len(movie_ids), len(tv_ids))
+    merge_final(day, len(movie_ids), len(tv_ids), movie_ids, tv_ids)
     state["complete"] = True
     state["completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     atomic_json(STATE, state)
